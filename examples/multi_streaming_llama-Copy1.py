@@ -15,7 +15,6 @@ from torch.nn.parameter import Parameter
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import transformers
-from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 import math
 
 from tqdm import tqdm
@@ -102,27 +101,6 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids):
     return q_embed, k_embed
 
 
-def apply_rotary_pos_emb_query(q, cos, sin, position_ids):
-    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
-    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
-    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    print('apply_rotary_pos_emb_query', q.shape, cos.shape, rotate_half(q).shape)
-    q_embed = (q * cos) + (rotate_half(q) * sin)
-    return q_embed
-
-
-def apply_rotary_pos_emb_key(k, cos, sin, position_ids):
-    # The first two dimensions of cos and sin are always 1, so we can `squeeze` them.
-    cos = cos.squeeze(1).squeeze(0)  # [seq_len, dim]
-    sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
-    cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    print('apply_rotary_pos_emb_key', k.shape, cos.shape, rotate_half(k).shape)
-    k_embed = (k * cos) + (rotate_half(k) * sin)
-    return k_embed
-
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -201,19 +179,15 @@ class LlamaAttention(nn.Module):
             key_states = gather_from_conv_parallel_region(key_states)
             value_states = value_states.contiguous()
             value_states = gather_from_conv_parallel_region(value_states)
-            position_ids_key = torch.arange(0, key_states.shape[-2], dtype=torch.long)
-            position_ids_key = position_ids_key.unsqueeze(0).view(-1, key_states.shape[-2])
+            print(key_states.shape, value_states.shape)
+            raise ValueError("past_key_value is None")
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
         cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
-        if past_key_value is None:
-            query_states = apply_rotary_pos_emb_query(query_states, cos, sin, position_ids)
-            key_states = apply_rotary_pos_emb_key(key_states, cos, sin, position_ids_key)
-        else:
-            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
-        
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+
         if past_key_value is not None:
             # reuse k, v, self_attention
             key_states = torch.cat([past_key_value[0], key_states], dim=2)
@@ -236,11 +210,10 @@ class LlamaAttention(nn.Module):
             )
 
         if attention_mask is not None:
-            print(attention_mask.shape, attn_weights.shape, attention_mask[0][0][0])
-            # if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
-            #     raise ValueError(
-            #         f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
-            #     )
+            if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
+                raise ValueError(
+                    f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
+                )
             attn_weights = attn_weights + attention_mask
 
         # upcast attention to fp32
@@ -305,6 +278,8 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
     last_dim = -1
     tensor_list = torch.split(input_ids, chunk_sizes, dim=last_dim)
     input_ids = tensor_list[rank].contiguous()
+
+    print(input_ids.shape, position_ids.shape)
     
     outputs = model(
         input_ids=input_ids,
@@ -394,7 +369,8 @@ def main(rank, args, world_size):
     test_filepath = os.path.join(args.data_root, "mt_bench.jsonl")
     print(f"Loading data from {test_filepath} ...")
 
-    model.cuda()
+    print(rank, model.device)
+    raise RuntimeError
 
     if not os.path.exists(test_filepath):
         download_url(
