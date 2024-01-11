@@ -244,6 +244,7 @@ def RecursiveVisit(name, module, upper_module):
 def main(args):
     model_name_or_path = args.model_name_or_path
     model, tokenizer = load(model_name_or_path)
+    model.cuda()
     RecursiveVisit('module', model, model)
     test_filepath = os.path.join(args.data_root, "mt_bench.jsonl")
     print(f"Loading data from {test_filepath} ...")
