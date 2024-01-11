@@ -238,7 +238,6 @@ class LlamaAttention(nn.Module):
             )
 
         if attention_mask is not None:
-            print(attention_mask.shape, attn_weights.shape, attention_mask[0][0][0])
             # if attention_mask.size() != (bsz, 1, q_len, kv_seq_len):
             #     raise ValueError(
             #         f"Attention mask should be of size {(bsz, 1, q_len, kv_seq_len)}, but is {attention_mask.size()}"
@@ -398,6 +397,30 @@ class LlamaModel(LlamaPreTrainedModel):
         else:
             position_ids = position_ids.view(-1, seq_length).long()
 
+        # TODO
+        group = torch.distributed.distributed_c10d._get_default_group()
+        rank = torch.distributed.get_rank(group=group)
+        world_size = torch.distributed.get_world_size(group=group)
+        if past_key_values is None:
+            length = len(input_ids[0])
+            global padding
+            padding = length % world_size
+            chunk_sizes = generate_chunk_sizes(length, world_size)
+            
+            if rank == 0:
+                past_length = 0
+            else:
+                past_length = sum(chunk_sizes[:rank])
+            
+            last_dim = -1
+            tensor_list = torch.split(input_ids, chunk_sizes, dim=last_dim)
+            input_ids = tensor_list[rank].contiguous()
+
+        
+            tensor_list = torch.split(position_ids, chunk_sizes, dim=last_dim)
+            position_ids = tensor_list[rank]
+            
+
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         # embed positions
@@ -408,6 +431,12 @@ class LlamaModel(LlamaPreTrainedModel):
         attention_mask = self._prepare_decoder_attention_mask(
             attention_mask, (batch_size, seq_length), inputs_embeds, past_key_values_length
         )
+
+        
+        if past_key_values is None:
+            tensor_list = torch.split(attention_mask, chunk_sizes, dim=2)
+            attention_mask = tensor_list[rank].contiguous()
+
 
         hidden_states = inputs_embeds
 
@@ -684,24 +713,6 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
     rank = torch.distributed.get_rank(group=group)
     world_size = torch.distributed.get_world_size(group=group)
 
-    # length = len(input_ids[0])
-    # global padding
-    # padding = length % world_size
-    # chunk_sizes = generate_chunk_sizes(length, world_size)
-
-    # if rank == 0:
-    #     past_length = 0
-    # else:
-    #     past_length = sum(chunk_sizes[:rank])
-    # position_ids = torch.arange(past_length, chunk_sizes[rank] + past_length, dtype=torch.long)
-    # position_ids = position_ids.unsqueeze(0).view(-1, chunk_sizes[rank])
-    # position_ids = position_ids.cuda()
-    # print(position_ids)
-    
-
-    # last_dim = -1
-    # tensor_list = torch.split(input_ids, chunk_sizes, dim=last_dim)
-    # input_ids = tensor_list[rank].contiguous()
     
     outputs = model(
         input_ids=input_ids,
@@ -790,7 +801,7 @@ def main(rank, args, world_size):
 
     model = LlamaForCausalLM(model)
     
-    # RecursiveVisit('module', model, model)
+    RecursiveVisit('module', model, model)
     test_filepath = os.path.join(args.data_root, "mt_bench.jsonl")
     print(f"Loading data from {test_filepath} ...")
 
