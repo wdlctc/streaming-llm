@@ -203,32 +203,45 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
 
         now = len(generated_text) - 1
         if now > pos:
-            print(" ".join(generated_text[pos:now]), end=" ", flush=True)
+            # print(" ".join(generated_text[pos:now]), end=" ", flush=True)
             pos = now
 
         if pred_token_idx == tokenizer.eos_token_id:
             break
-    print(" ".join(generated_text[pos:]), flush=True)
+    # print(" ".join(generated_text[pos:]), flush=True)
     return past_key_values
 
 
 @torch.no_grad()
 def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=1000):
     past_key_values = None
+
+    start_time = time.time()
     for idx, prompt in enumerate(prompts):
-        prompt = "USER: " + prompt + "\n\nASSISTANT: "
-        print("\n" + prompt, end="")
+        epoch_start_time = time.time()
+        # prompt = "USER: " + prompt + "\n\nASSISTANT: "
+        # print("\n" + prompt, end="")
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
         input_ids = input_ids.to(model.device)
         seq_len = input_ids.shape[1]
-        if kv_cache is not None:
-            space_needed = seq_len + max_gen_len
-            past_key_values = kv_cache.evict_for_space(past_key_values, space_needed)
+        # if kv_cache is not None:
+        #     space_needed = seq_len + max_gen_len
+        #     past_key_values = kv_cache.evict_for_space(past_key_values, space_needed)
+        past_key_values = None
 
         past_key_values = greedy_generate(
             model, tokenizer, input_ids, past_key_values, max_gen_len=max_gen_len
         )
-        break
+        elapsed = time.time() - start_time
+        # if dist.get_rank() == 0:
+        print("| batch {:5d} | time {:5.2f} ".format(
+                    idx, elapsed
+                )
+            )
+        start_time = time.time()
+        if idx > 10:
+            break
+        
 
 def RecursiveVisit(name, module, upper_module):
     has_child = any(isinstance(child, nn.Module) for child in module.children())

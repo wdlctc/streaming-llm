@@ -16,6 +16,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import transformers
 import math
+import torch.nn.functional as F
 
 from tqdm import tqdm
 from streaming_llm.utils import load, download_url, load_jsonl
@@ -50,7 +51,6 @@ class _GatherFromConvParallelRegion(torch.autograd.Function):
         tensor_list = [torch.empty_like(input_) for _ in range(world_size)]
         tensor_list[rank] = input_
         input_ = input_.contiguous()
-        print(tensor_list[rank].shape)
         torch.distributed.all_gather(tensor_list, input_, group=group)
 
         # Note: torch.cat already creates a contiguous tensor.
@@ -110,7 +110,6 @@ def apply_rotary_pos_emb_query(q, cos, sin, position_ids):
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
     cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    print('apply_rotary_pos_emb_query', q.shape, cos.shape, rotate_half(q).shape)
     q_embed = (q * cos) + (rotate_half(q) * sin)
     return q_embed
 
@@ -121,7 +120,6 @@ def apply_rotary_pos_emb_key(k, cos, sin, position_ids):
     sin = sin.squeeze(1).squeeze(0)  # [seq_len, dim]
     cos = cos[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
     sin = sin[position_ids].unsqueeze(1)  # [bs, 1, seq_len, dim]
-    print('apply_rotary_pos_emb_key', k.shape, cos.shape, rotate_half(k).shape)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return k_embed
 
@@ -198,7 +196,6 @@ class LlamaAttention(nn.Module):
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         if past_key_value is None:
-            print('key_states.shape, value_states.shape',key_states.shape, value_states.shape)
             key_states = key_states.contiguous()
             key_states = gather_from_conv_parallel_region(key_states)
             value_states = value_states.contiguous()
@@ -722,6 +719,7 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
     )
     past_key_values = outputs.past_key_values
     pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+    torch.distributed.broadcast(pred_token_idx, src=world_size-1)
     generated_ids = [pred_token_idx.item()]
     pos = 0
 
@@ -748,35 +746,48 @@ def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
 
         now = len(generated_text) - 1
         if now > pos:
-            if rank == 0:
-                print(" ".join(generated_text[pos:now]), end=" ", flush=True)
+            # if rank == 0:
+                # print(" ".join(generated_text[pos:now]), end=" ", flush=True)
             pos = now
 
         if pred_token_idx == tokenizer.eos_token_id:
             break
     
-    if rank == 0:
-        print(" ".join(generated_text[pos:]), flush=True)
+    # if rank == 0:
+        # print(" ".join(generated_text[pos:]), flush=True)
     return past_key_values
+
 
 
 @torch.no_grad()
 def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=1000):
     past_key_values = None
+
+    start_time = time.time()
     for idx, prompt in enumerate(prompts):
+        epoch_start_time = time.time()
         prompt = "USER: " + prompt + "\n\nASSISTANT: "
-        print("\n" + prompt, end="")
+        # print("\n" + prompt, end="")
         input_ids = tokenizer(prompt, return_tensors="pt").input_ids
         input_ids = input_ids.to(model.device)
         seq_len = input_ids.shape[1]
-        if kv_cache is not None:
-            space_needed = seq_len + max_gen_len
-            past_key_values = kv_cache.evict_for_space(past_key_values, space_needed)
+        # if kv_cache is not None:
+        #     space_needed = seq_len + max_gen_len
+        #     past_key_values = kv_cache.evict_for_space(past_key_values, space_needed)
+        past_key_values = None
 
         past_key_values = greedy_generate(
             model, tokenizer, input_ids, past_key_values, max_gen_len=max_gen_len
         )
-        break
+        elapsed = time.time() - start_time
+        if dist.get_rank() == 0:
+            print("| batch {:5d} | time {:5.2f} ".format(
+                        idx, elapsed
+                    )
+                )
+        start_time = time.time()
+        if idx > 10:
+            break
 
 def RecursiveVisit(name, module, upper_module):
     has_child = any(isinstance(child, nn.Module) for child in module.children())
