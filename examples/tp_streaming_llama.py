@@ -16,12 +16,112 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import transformers
 import math
+import torch.nn.functional as F
 
 from tqdm import tqdm
 from streaming_llm.utils import load, download_url, load_jsonl
 from streaming_llm.enable_streaming_llm import enable_streaming_llm
 
+from transformers.models.llama.modeling_llama import LlamaPreTrainedModel
+from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
+
 from typing import Union, List, Tuple, Optional
+
+def generate_chunk_sizes(tensor_size, num_chunks):
+    base_chunk_size = tensor_size // num_chunks
+    remainder = tensor_size % num_chunks
+
+    # Create a list of chunk sizes, initially all equal to the base size
+    chunk_sizes = [base_chunk_size] * num_chunks
+
+    # Distribute the remainder, starting from the last chunk
+    for i in range(0, remainder):
+        chunk_sizes[i] += 1
+
+    return chunk_sizes
+
+@torch.no_grad()
+def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
+    group = torch.distributed.distributed_c10d._get_default_group()
+    rank = torch.distributed.get_rank(group=group)
+    world_size = torch.distributed.get_world_size(group=group)
+
+    
+    outputs = model(
+        input_ids=input_ids,
+        past_key_values=past_key_values,
+        use_cache=True,
+    )
+    past_key_values = outputs.past_key_values
+    pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+    generated_ids = [pred_token_idx.item()]
+    pos = 0
+    for _ in range(max_gen_len - 1):
+        outputs = model(
+            input_ids=pred_token_idx,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
+        past_key_values = outputs.past_key_values
+        pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+        generated_ids.append(pred_token_idx.item())
+        generated_text = (
+            tokenizer.decode(
+                generated_ids,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True,
+                spaces_between_special_tokens=False,
+            )
+            .strip()
+            .split(" ")
+        )
+
+        now = len(generated_text) - 1
+        if now > pos:
+            if rank == 0:
+                print(" ".join(generated_text[pos:now]), end=" ", flush=True)
+            pos = now
+
+        if pred_token_idx == tokenizer.eos_token_id:
+            break
+    
+    if rank == 0:
+        print(" ".join(generated_text[pos:]), flush=True)
+    return past_key_values
+
+
+@torch.no_grad()
+def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=1000):
+    past_key_values = None
+
+    time_list = []
+    start_time = time.time()
+    for idx, prompt in enumerate(prompts):
+        epoch_start_time = time.time()
+        prompt = "USER: " + prompt + "\n\nASSISTANT: "
+        print("\n" + prompt, end="")
+        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
+        input_ids = input_ids.to(model.device)
+        seq_len = input_ids.shape[1]
+        # if kv_cache is not None:
+        #     space_needed = seq_len + max_gen_len
+        #     past_key_values = kv_cache.evict_for_space(past_key_values, space_needed)
+        past_key_values = None
+
+        past_key_values = greedy_generate(
+            model, tokenizer, input_ids, past_key_values, max_gen_len=max_gen_len
+        )
+        elapsed = time.time() - start_time
+        time_list.append(elapsed)
+        if dist.get_rank() == 0:
+            print("| batch {:5d} | time {:5.2f} ".format(
+                        idx, elapsed
+                    )
+                )
+        start_time = time.time()
+        if idx > 10:
+            break
+    print(time_list)
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -57,7 +157,6 @@ class LlamaAttention(nn.Module):
     def __init__(self, ref):
         super().__init__()
 
-        print()
         self.config = ref.config
         self.hidden_size = ref.hidden_size
         self.num_heads = ref.num_heads
@@ -87,31 +186,35 @@ class LlamaAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
+        group = torch.distributed.distributed_c10d._get_default_group()
+        rank = torch.distributed.get_rank(group=group)
+        world_size = torch.distributed.get_world_size(group=group)
+        self.config.pretraining_tp = 2
+        
         if self.config.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
                 (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
-            )
-            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
-            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
+            )[rank]
+            key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)[rank]
+            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)[rank]
 
-            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
-            query_states = torch.cat(query_states, dim=-1)
-
-            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
-            key_states = torch.cat(key_states, dim=-1)
-
-            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
-            value_states = torch.cat(value_states, dim=-1)
+            query_states = F.linear(hidden_states, query_slices)
+            key_states = F.linear(hidden_states, key_slices)
+            value_states = F.linear(hidden_states, value_slices)
+            num_heads = self.num_heads // self.config.pretraining_tp
+            num_key_value_heads = self.num_key_value_heads // self.config.pretraining_tp
+            hidden_size = self.hidden_size // self.config.pretraining_tp
 
         else:
             query_states = self.q_proj(hidden_states)
             key_states = self.k_proj(hidden_states)
             value_states = self.v_proj(hidden_states)
+            num_heads = self.num_heads
 
-        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        query_states = query_states.view(bsz, q_len, num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, num_key_value_heads, self.head_dim).transpose(1, 2)
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
@@ -132,9 +235,9 @@ class LlamaAttention(nn.Module):
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if attn_weights.size() != (bsz, self.num_heads, q_len, kv_seq_len):
+        if attn_weights.size() != (bsz, num_heads, q_len, kv_seq_len):
             raise ValueError(
-                f"Attention weights should be of size {(bsz, self.num_heads, q_len, kv_seq_len)}, but is"
+                f"Attention weights should be of size {(bsz, num_heads, q_len, kv_seq_len)}, but is"
                 f" {attn_weights.size()}"
             )
 
@@ -149,19 +252,22 @@ class LlamaAttention(nn.Module):
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
 
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
+        if attn_output.size() != (bsz, num_heads, q_len, self.head_dim):
             raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
+                f"`attn_output` should be of size {(bsz, num_heads, q_len, self.head_dim)}, but is"
                 f" {attn_output.size()}"
             )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
+        attn_output = attn_output.reshape(bsz, q_len, hidden_size)
 
         if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
+            # attn_output = attn_output.split(hidden_size // self.config.pretraining_tp, dim=2)
+            o_proj_slices = self.o_proj.weight.split(hidden_size, dim=1)[rank]
+            # attn_output = F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
+
+            attn_output = F.linear(attn_output, o_proj_slices)
+            torch.distributed.all_reduce(attn_output, group=group)
         else:
             attn_output = self.o_proj(attn_output)
 
@@ -170,79 +276,6 @@ class LlamaAttention(nn.Module):
 
         return attn_output, attn_weights, past_key_value
 
-@torch.no_grad()
-def greedy_generate(model, tokenizer, input_ids, past_key_values, max_gen_len):
-    outputs = model(
-        input_ids=input_ids,
-        past_key_values=past_key_values,
-        use_cache=True,
-    )
-    past_key_values = outputs.past_key_values
-    pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-    generated_ids = [pred_token_idx.item()]
-    pos = 0
-    for _ in range(max_gen_len - 1):
-        outputs = model(
-            input_ids=pred_token_idx,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
-        past_key_values = outputs.past_key_values
-        pred_token_idx = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-        generated_ids.append(pred_token_idx.item())
-        generated_text = (
-            tokenizer.decode(
-                generated_ids,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=True,
-                spaces_between_special_tokens=False,
-            )
-            .strip()
-            .split(" ")
-        )
-
-        now = len(generated_text) - 1
-        if now > pos:
-            print(" ".join(generated_text[pos:now]), end=" ", flush=True)
-            pos = now
-
-        if pred_token_idx == tokenizer.eos_token_id:
-            break
-    print(" ".join(generated_text[pos:]), flush=True)
-    return past_key_values
-
-
-@torch.no_grad()
-def streaming_inference(model, tokenizer, prompts, kv_cache=None, max_gen_len=1000):
-    past_key_values = None
-
-    time_list = []
-    start_time = time.time()
-    for idx, prompt in enumerate(prompts):
-        epoch_start_time = time.time()
-        prompt = "USER: " + prompt + "\n\nASSISTANT: "
-        print("\n" + prompt, end="")
-        input_ids = tokenizer(prompt, return_tensors="pt").input_ids
-        input_ids = input_ids.to(model.device)
-        seq_len = input_ids.shape[1]
-        # if kv_cache is not None:
-        #     space_needed = seq_len + max_gen_len
-        #     past_key_values = kv_cache.evict_for_space(past_key_values, space_needed)
-        past_key_values = None
-
-        past_key_values = greedy_generate(
-            model, tokenizer, input_ids, past_key_values, max_gen_len=max_gen_len
-        )
-        elapsed = time.time() - start_time
-        time_list.append(elapsed)
-        print("| batch {:5d} | time {:5.2f} ".format(
-                    idx, elapsed
-                ))
-        start_time = time.time()
-        if idx > 10:
-            break
-    print(time_list)
-        
 
 def RecursiveVisit(name, module, upper_module):
     has_child = any(isinstance(child, nn.Module) for child in module.children())
@@ -255,11 +288,18 @@ def RecursiveVisit(name, module, upper_module):
         for name, child in module.named_children():
             RecursiveVisit(name, child, module)
 
-def main(args):
+def main(rank, args, world_size):
+    init_method_pgroup = "tcp://localhost:{}".format(29555)
+    torch.distributed.init_process_group(
+        backend="nccl", rank=rank, world_size=world_size, init_method=init_method_pgroup
+    )
+    torch.cuda.set_device(rank)
+
     model_name_or_path = args.model_name_or_path
     model, tokenizer = load(model_name_or_path)
+    RecursiveVisit("model", model, model)
     model.cuda()
-    RecursiveVisit('module', model, model)
+
     test_filepath = os.path.join(args.data_root, "mt_bench.jsonl")
     print(f"Loading data from {test_filepath} ...")
 
@@ -301,4 +341,14 @@ if __name__ == "__main__":
     parser.add_argument("--recent_size", type=int, default=2000)
     args = parser.parse_args()
 
-    main(args)
+    
+    num_devices = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    print(torch.cuda.device_count())
+
+    
+    mp.spawn(
+        main,
+        args=(args, num_devices),
+        nprocs=num_devices,
+        join=True,
+    )
